@@ -52,3 +52,4 @@
 [submodule "External/rpmalloc"]
 	path = External/rpmalloc
 	url = https://github.com/FEX-Emu/rpmalloc.git
+	branch = fex
