@@ -26,6 +26,7 @@
 [submodule "External/xxhash"]
 	path = External/xxhash
 	url = https://github.com/Cyan4973/xxHash.git
+	branch = release
 [submodule "External/Catch2"]
 	path = External/Catch2
 	url = https://github.com/catchorg/Catch2.git
