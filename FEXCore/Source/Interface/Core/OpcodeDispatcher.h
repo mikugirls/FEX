@@ -523,9 +523,9 @@ public:
   void PSRAIOp(OpcodeArgs, IR::OpSize ElementSize);
   void MOVDDUPOp(OpcodeArgs);
   void CVTFPR_To_GPR(OpcodeArgs, IR::OpSize SrcElementSize, bool HostRoundingMode);
-  void Vector_CVT_Int_To_Float(OpcodeArgs, IR::OpSize SrcElementSize, bool Widen);
+  void Vector_CVT_Int_To_Float(OpcodeArgs, IR::OpSize SrcElementSize, bool Widen, bool IsAVX);
   void Vector_CVT_Float_To_Float(OpcodeArgs, IR::OpSize DstElementSize, IR::OpSize SrcElementSize, bool IsAVX);
-  void Vector_CVT_Float_To_Int(OpcodeArgs, IR::OpSize SrcElementSize, bool HostRoundingMode);
+  void Vector_CVT_Float_To_Int(OpcodeArgs, IR::OpSize SrcElementSize, bool HostRoundingMode, bool IsAVX);
   void MMX_To_XMM_Vector_CVT_Int_To_Float(OpcodeArgs);
   void XMM_To_MMX_Vector_CVT_Float_To_Int(OpcodeArgs, IR::OpSize SrcElementSize, bool HostRoundingMode);
   void MASKMOVOp(OpcodeArgs);
@@ -861,6 +861,7 @@ public:
   RefVSIB LoadVSIB(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags);
   void VPGATHER(OpcodeArgs, OpSize AddrElementSize);
 
+  void AVXExtendVectorElements(OpcodeArgs, IR::OpSize ElementSize, IR::OpSize DstElementSize, bool Signed);
   void ExtendVectorElements(OpcodeArgs, IR::OpSize ElementSize, IR::OpSize DstElementSize, bool Signed);
 
   void VectorRound(OpcodeArgs, IR::OpSize ElementSize);
@@ -871,7 +872,10 @@ public:
   void VectorVariableBlend(OpcodeArgs, IR::OpSize ElementSize);
   void PTestOpImpl(OpSize Size, Ref Dest, Ref Src);
   void PTestOp(OpcodeArgs);
+
+  void AVXPHMINPOSUWOp(OpcodeArgs);
   void PHMINPOSUWOp(OpcodeArgs);
+
   void DPPOp(OpcodeArgs, IR::OpSize ElementSize);
 
   void MPSADBWOp(OpcodeArgs);
