@@ -606,7 +606,20 @@ void OpDispatchBuilder::InsertScalarFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags, {.AllowUpperGarbage = true});
 
   Ref Result = InsertScalarFCMPOpImpl(DstSize, OpSizeFromDst(Op), ElementSize, Src1, Src2, CompType & 0b111, false);
-  StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, Result);
+
+  // ARM doesn't have any instructions that handle the semantics of NLT and NLE directly.
+  // In fact, these are the two SSE compatison types where we cannot use VFCMPScalarInsert
+  // to handle them. They need to be handled separately due to negation. So, to avoid
+  // making all other comparison types suffer, we can just special case these two for insertion.
+  //
+  // All other comparison types do insertion as part of their behavior, so these can go down
+  // the non-insertion path.
+  const auto VCompType = VectorCompareType {CompType};
+  if (VCompType == VectorCompareType::NLT_US || VCompType == VectorCompareType::NLE_US) {
+    StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, Result);
+  } else {
+    StoreResultFPR(Op, Result);
+  }
 }
 
 void OpDispatchBuilder::AVXInsertScalarFCMPOp(OpcodeArgs, IR::OpSize ElementSize) {
@@ -1780,6 +1793,15 @@ Ref OpDispatchBuilder::SHUFOpImpl(OpcodeArgs, IR::OpSize DstSize, IR::OpSize Ele
   const uint8_t ShiftAmount = std::popcount(SelectionMask);
 
   if (Is256Bit) {
+    if (ElementSize == OpSize::i64Bit) {
+      if (Shuffle == 0) {
+        return _VTrn(DstSize, ElementSize, Src1, Src2);
+      }
+      if (Shuffle == 0b1111) {
+        return _VTrn2(DstSize, ElementSize, Src1, Src2);
+      }
+    }
+
     for (uint8_t Element = 0; Element < NumElements; ++Element) {
       const auto SrcIndex1 = Shuffle & SelectionMask;
 
@@ -2730,9 +2752,6 @@ void OpDispatchBuilder::Vector_CVT_Float_To_Float(OpcodeArgs, IR::OpSize DstElem
   if (IsAVX) {
     if (!IsFloatSrc && !Is128Bit) {
       // VCVTPD2PS path
-      Result = _VMov(OpSize::i128Bit, Result);
-    } else if (IsFloatSrc && Is128Bit) {
-      // VCVTPS2PD path
       Result = _VMov(OpSize::i128Bit, Result);
     }
 
