@@ -1725,46 +1725,39 @@ void OpDispatchBuilder::PSHUFDOp(OpcodeArgs) {
 void OpDispatchBuilder::VPSHUFWOp(OpcodeArgs, IR::OpSize ElementSize, bool Low) {
   const auto SrcSize = OpSizeFromSrc(Op);
   const auto Is256Bit = SrcSize == OpSize::i256Bit;
-  auto Shuffle = Op->Src[1].Literal();
+  const auto Shuffle = Op->Src[1].Literal();
 
   Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+  Ref Result {};
 
-  // Note/TODO: With better immediate facilities or vector loading in our IR
-  //            much of this can be reduced to setting up a table index register
-  //            and then using TBL
-  //
-  //            SVE has the INDEX instruction that works essentially like
-  //            std::iota (setting a range to an initial value and progressively
-  //            incrementing each successive element), so it's well suited for this.
-  //            It's just a matter of exposing these facilities in a way that works
-  //            well together.
-  //
-  //            Should be much nicer than doing repeated inserts in any case.
+  if (ElementSize == OpSize::i16Bit) {
+    // Note/TODO: Ideally we would handle both lanes at once instead of
+    //            doing the 256-bit case as two separate 128-bit operations.
+    const auto ShuffleConst =
+      Low ? IR::IndexNamedVectorConstant::INDEXED_NAMED_VECTOR_PSHUFLW : IR::IndexNamedVectorConstant::INDEXED_NAMED_VECTOR_PSHUFHW;
 
-  const size_t BaseElement = Low ? 0 : 4;
-  Ref Result = Src;
-  if (Is256Bit) {
-    for (size_t i = 0; i < 4; i++) {
-      const auto Index = Shuffle & 0b11;
-      const auto UpperLaneOffset = IR::NumElements(OpSize::i128Bit, ElementSize);
+    if (Is256Bit) {
+      auto UpperLane = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Src, 1);
 
-      const auto LowDstIndex = BaseElement + i;
-      const auto LowSrcIndex = BaseElement + Index;
+      auto ResultHi = PShufWLane(OpSize::i128Bit, ShuffleConst, Low, UpperLane, Shuffle);
+      auto ResultLo = PShufWLane(OpSize::i128Bit, ShuffleConst, Low, Src, Shuffle);
 
-      const auto HighDstIndex = BaseElement + UpperLaneOffset + i;
-      const auto HighSrcIndex = BaseElement + UpperLaneOffset + Index;
-
-      // Take care of both lanes per iteration
-      Result = _VInsElement(SrcSize, ElementSize, LowDstIndex, LowSrcIndex, Result, Src);
-      Result = _VInsElement(SrcSize, ElementSize, HighDstIndex, HighSrcIndex, Result, Src);
-
-      Shuffle >>= 2;
+      Result = _VInsElement(SrcSize, OpSize::i128Bit, 1, 0, ResultLo, ResultHi);
+    } else {
+      Result = PShufWLane(SrcSize, ShuffleConst, Low, Src, Shuffle);
+      Result = _VMov(OpSize::i128Bit, Result);
     }
   } else {
-    for (size_t i = 0; i < 4; i++) {
-      const auto Index = Shuffle & 0b11;
-      Result = _VInsElement(SrcSize, ElementSize, BaseElement + i, BaseElement + Index, Result, Src);
-      Shuffle >>= 2;
+    if (Is256Bit) {
+      auto UpperLane = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Src, 1);
+
+      auto ResultHi = Single128Bit4ByteVectorShuffle(UpperLane, Shuffle);
+      auto ResultLo = Single128Bit4ByteVectorShuffle(Src, Shuffle);
+
+      Result = _VInsElement(SrcSize, OpSize::i128Bit, 1, 0, ResultLo, ResultHi);
+    } else {
+      Result = Single128Bit4ByteVectorShuffle(Src, Shuffle);
+      Result = _VMov(OpSize::i128Bit, Result);
     }
   }
 
@@ -2064,28 +2057,14 @@ void OpDispatchBuilder::PINSROp(OpcodeArgs, IR::OpSize ElementSize) {
   StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, Result);
 }
 
-void OpDispatchBuilder::VPINSRBOp(OpcodeArgs) {
-  Ref Result = PINSROpImpl(Op, OpSize::i8Bit, Op->Src[0], Op->Src[1], Op->Src[2]);
-  if (Op->Dest.Data.GPR.GPR == Op->Src[0].Data.GPR.GPR) {
-    Result = _VMov(OpSize::i128Bit, Result);
-  }
+void OpDispatchBuilder::VPINSRBWOp(OpcodeArgs, IR::OpSize ElementSize) {
+  Ref Result = PINSROpImpl(Op, ElementSize, Op->Src[0], Op->Src[1], Op->Src[2]);
   StoreResultFPR(Op, Result);
 }
 
 void OpDispatchBuilder::VPINSRDQOp(OpcodeArgs) {
   const auto SrcSize = OpSizeFromSrc(Op);
   Ref Result = PINSROpImpl(Op, SrcSize, Op->Src[0], Op->Src[1], Op->Src[2]);
-  if (Op->Dest.Data.GPR.GPR == Op->Src[0].Data.GPR.GPR) {
-    Result = _VMov(OpSize::i128Bit, Result);
-  }
-  StoreResultFPR(Op, Result);
-}
-
-void OpDispatchBuilder::VPINSRWOp(OpcodeArgs) {
-  Ref Result = PINSROpImpl(Op, OpSize::i16Bit, Op->Src[0], Op->Src[1], Op->Src[2]);
-  if (Op->Dest.Data.GPR.GPR == Op->Src[0].Data.GPR.GPR) {
-    Result = _VMov(OpSize::i128Bit, Result);
-  }
   StoreResultFPR(Op, Result);
 }
 
@@ -5023,15 +5002,48 @@ void OpDispatchBuilder::VPERMQOp(OpcodeArgs) {
   StoreResultFPR(Op, Result);
 }
 
-Ref OpDispatchBuilder::VBLENDOpImpl(IR::OpSize VecSize, IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref ZeroRegister, uint64_t Selector) {
-  const std::array Sources {Src1, Src2};
+Ref OpDispatchBuilder::VBLENDOpImpl(IR::OpSize VecSize, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint64_t Selector) {
+  const auto IsWordElements = ElementSize == OpSize::i16Bit;
+  const auto Is256Bit = VecSize == OpSize::i256Bit;
 
-  Ref Result = ZeroRegister;
+  const auto ElementsPerLane = uint32_t(IR::NumElements(OpSize::i128Bit, ElementSize));
+
+  // PBLENDW uses the same immediate size for 128-bit and 256-bit
+  // while all the others double in size.
+  const auto MaskSize = Is256Bit && !IsWordElements ? ElementsPerLane * 2 : ElementsPerLane;
+  const auto Mask = (1U << MaskSize) - 1;
+
+  // Now, we determine which mask portion has the higher population count.
+  // we use this to determine which source we use as the base to insert into.
+  //
+  // For example each bit in a mask that is set means that element in Src2
+  // will be inserted into the destination. If that bit is not set, then it's
+  // the element in Src1 that will be inserted instead.
+  //
+  // If we have more bits incoming from a particular source, then we can reappropriate
+  // that source as the destination and only perform inserts from the other source
+  // where necessary, which reduces the overall amount of element insertions that
+  // need to take place.
+  //
+  // In the event we tie, then we can just use Src1 and only perform incoming insertions
+  // that come from Src2.
+  const auto NumSrc2Bits = uint32_t(std::popcount(Selector & Mask));
+  const auto NumSrc1Bits = MaskSize - NumSrc2Bits;
+  const auto IsUsingSrc1 = NumSrc1Bits >= NumSrc2Bits;
+  Ref Result = IsUsingSrc1 ? Src1 : Src2;
+  Ref Source = IsUsingSrc1 ? Src2 : Src1;
+
   const auto NumElements = IR::NumElements(VecSize, ElementSize);
   for (int i = 0; i < NumElements; i++) {
     const auto SelectorIndex = (Selector >> i) & 1;
+    if (IsUsingSrc1 && SelectorIndex == 0) {
+      continue;
+    }
+    if (!IsUsingSrc1 && SelectorIndex != 0) {
+      continue;
+    }
 
-    Result = _VInsElement(VecSize, ElementSize, i, i, Result, Sources[SelectorIndex]);
+    Result = _VInsElement(VecSize, ElementSize, i, i, Result, Source);
   }
 
   return Result;
@@ -5040,7 +5052,8 @@ Ref OpDispatchBuilder::VBLENDOpImpl(IR::OpSize VecSize, IR::OpSize ElementSize, 
 void OpDispatchBuilder::VBLENDPDOp(OpcodeArgs) {
   const auto DstSize = OpSizeFromDst(Op);
   const auto Is256Bit = DstSize == OpSize::i256Bit;
-  const auto Selector = Op->Src[2].Literal();
+  const auto SelectorMask = Is256Bit ? 0b1111U : 0b11U;
+  const auto Selector = Op->Src[2].Literal() & SelectorMask;
 
   Ref Src1 = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
   Ref Src2 = LoadSourceFPR(Op, Op->Src[1], Op->Flags);
@@ -5051,21 +5064,21 @@ void OpDispatchBuilder::VBLENDPDOp(OpcodeArgs) {
     return;
   }
   // Only the first four bits of the 8-bit immediate are used, so only check them.
-  if (((Selector & 0b11) == 0b11 && !Is256Bit) || (Selector & 0b1111) == 0b1111) {
+  if ((Selector == 0b11 && !Is256Bit) || Selector == 0b1111) {
     Ref Result = Is256Bit ? Src2 : _VMov(OpSize::i128Bit, Src2);
     StoreResultFPR(Op, Result);
     return;
   }
 
-  const auto ZeroRegister = LoadZeroVector(DstSize);
-  Ref Result = VBLENDOpImpl(DstSize, OpSize::i64Bit, Src1, Src2, ZeroRegister, Selector);
+  Ref Result = VBLENDOpImpl(DstSize, OpSize::i64Bit, Src1, Src2, Selector);
   StoreResultFPR(Op, Result);
 }
 
 void OpDispatchBuilder::VPBLENDDOp(OpcodeArgs) {
   const auto DstSize = OpSizeFromDst(Op);
   const auto Is256Bit = DstSize == OpSize::i256Bit;
-  const auto Selector = Op->Src[2].Literal();
+  const auto SelectorMask = Is256Bit ? 0b1111'1111U : 0b1111U;
+  const auto Selector = Op->Src[2].Literal() & SelectorMask;
 
   Ref Src1 = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
   Ref Src2 = LoadSourceFPR(Op, Op->Src[1], Op->Flags);
@@ -5092,16 +5105,12 @@ void OpDispatchBuilder::VPBLENDDOp(OpcodeArgs) {
   // are the first four bits. We do a bitwise check here to catch cases where
   // silliness is going on and the upper bits are being set even when they'll
   // be ignored
-  if ((Selector & 0xF) == 0xF && !Is256Bit) {
+  if (Selector == 0xF && !Is256Bit) {
     StoreResultFPR(Op, _VMov(OpSize::i128Bit, Src2));
     return;
   }
 
-  const auto ZeroRegister = LoadZeroVector(DstSize);
-  Ref Result = VBLENDOpImpl(DstSize, OpSize::i32Bit, Src1, Src2, ZeroRegister, Selector);
-  if (!Is256Bit) {
-    Result = _VMov(OpSize::i128Bit, Result);
-  }
+  Ref Result = VBLENDOpImpl(DstSize, OpSize::i32Bit, Src1, Src2, Selector);
   StoreResultFPR(Op, Result);
 }
 
@@ -5129,11 +5138,7 @@ void OpDispatchBuilder::VPBLENDWOp(OpcodeArgs) {
   // imm for the helper function to use.
   const auto NewSelector = Selector << 8 | Selector;
 
-  const auto ZeroRegister = LoadZeroVector(DstSize);
-  Ref Result = VBLENDOpImpl(DstSize, OpSize::i16Bit, Src1, Src2, ZeroRegister, NewSelector);
-  if (Is128Bit) {
-    Result = _VMov(OpSize::i128Bit, Result);
-  }
+  Ref Result = VBLENDOpImpl(DstSize, OpSize::i16Bit, Src1, Src2, NewSelector);
   StoreResultFPR(Op, Result);
 }
 
