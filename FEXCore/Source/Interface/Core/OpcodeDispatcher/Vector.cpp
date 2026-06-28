@@ -3954,7 +3954,7 @@ Ref OpDispatchBuilder::PSADBWOpImpl(IR::OpSize Size, Ref Src1, Ref Src2) {
 
   Ref Result_Low = _VAddV(OpSize::i128Bit, OpSize::i16Bit, AbsResult_Low);
   Ref Result_High = _VAddV(OpSize::i128Bit, OpSize::i16Bit, AbsResult_High);
-  auto Low = _VZip(Size, OpSize::i64Bit, Result_Low, Result_High);
+  auto Low = _VZip(OpSize::i128Bit, OpSize::i64Bit, Result_Low, Result_High);
 
   if (Is128Bit) {
     return Low;
@@ -3965,12 +3965,12 @@ Ref OpDispatchBuilder::PSADBWOpImpl(IR::OpSize Size, Ref Src1, Ref Src2) {
 
   Ref HighResult_Low = _VAddV(OpSize::i128Bit, OpSize::i16Bit, HighSrc1);
   Ref HighResult_High = _VAddV(OpSize::i128Bit, OpSize::i16Bit, HighSrc2);
+  Ref High = _VZip(OpSize::i128Bit, OpSize::i64Bit, HighResult_Low, HighResult_High);
 
-  Ref High = _VInsElement(Size, OpSize::i64Bit, 1, 0, HighResult_Low, HighResult_High);
-  Ref Full = _VInsElement(Size, OpSize::i128Bit, 1, 0, Low, High);
+  Ref AmendedHigh = _VInsElement(OpSize::i128Bit, OpSize::i64Bit, 0, 1, High, Low);
+  Ref AmendedLow = _VInsElement(OpSize::i128Bit, OpSize::i64Bit, 1, 0, Low, High);
 
-  Ref Tmp = _VInsElement(Size, OpSize::i64Bit, 2, 1, Full, Full);
-  return _VInsElement(Size, OpSize::i64Bit, 1, 2, Tmp, Full);
+  return _VInsElement(Size, OpSize::i128Bit, 1, 0, AmendedLow, AmendedHigh);
 }
 
 void OpDispatchBuilder::PSADBW(OpcodeArgs) {
@@ -5035,6 +5035,23 @@ void OpDispatchBuilder::VPERMQOp(OpcodeArgs) {
     // then this can be done fairly simply without any individual inserts.
     const auto Index = Selector & 0b11;
     Result = _VDupElement(DstSize, OpSize::i64Bit, Src, Index);
+    break;
+  }
+
+  case 0b01'01'00'00: {
+    Result = _VZip(DstSize, OpSize::i64Bit, Src, Src);
+    break;
+  }
+  case 0b11'11'10'10: {
+    Result = _VZip2(DstSize, OpSize::i64Bit, Src, Src);
+    break;
+  }
+  case 0b10'00'10'00: {
+    Result = _VUnZip(DstSize, OpSize::i64Bit, Src, Src);
+    break;
+  }
+  case 0b11'01'11'01: {
+    Result = _VUnZip2(DstSize, OpSize::i64Bit, Src, Src);
     break;
   }
 
