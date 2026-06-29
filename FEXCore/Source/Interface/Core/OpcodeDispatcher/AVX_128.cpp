@@ -630,7 +630,7 @@ void OpDispatchBuilder::AVX128_VPSIGN(OpcodeArgs, IR::OpSize ElementSize) {
 }
 
 void OpDispatchBuilder::AVX128_UCOMISx(OpcodeArgs, IR::OpSize ElementSize) {
-  const auto SrcSize = Op->Src[0].IsGPR() ? GetGuestVectorLength() : ElementSize;
+  const auto SrcSize = Op->Src[0].IsGPR() ? OpSize::i128Bit : ElementSize;
 
   auto Src1 = AVX128_LoadSource_WithOpSize(Op, Op->Dest, Op->Flags, false);
 
@@ -2293,9 +2293,8 @@ void OpDispatchBuilder::AVX128_VCVTPS2PH(OpcodeArgs) {
     _PopRoundingMode(OldFPCR);
   }
 
-  // We need to eliminate upper junk if we're storing into a register with
-  // a 256-bit source (VCVTPS2PH's destination for registers is an XMM).
-  if (Op->Src[0].IsGPR() && SrcSize == OpSize::i256Bit) {
+  // We need to zero the upper 128 bits if we're storing into a register
+  if (Op->Dest.IsGPR()) {
     Result = AVX128_Zext(Result.Low);
   }
 
