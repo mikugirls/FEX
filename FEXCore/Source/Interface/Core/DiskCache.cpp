@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 
+#include "FEXCore/Config/Config.h"
+#include "FEXCore/fextl/string.h"
 #include "FEXHeaderUtils/Filesystem.h"
 #include "FEXCore/Core/DiskCache.h"
+#include "FEXCore/Core/DiskCacheFileMapper.h"
 #include "FEXCore/Utils/LogManager.h"
 #include "Interface/Context/Context.h"
 #include "FEXCore/HLE/SyscallHandler.h"
@@ -9,6 +12,7 @@
 #include "FEXCore/fextl/memory.h"
 #include <cstdint>
 #include <cstring>
+#include <charconv>
 
 namespace FEXCore {
 
@@ -34,6 +38,8 @@ namespace DiskCache {
     };
 
   } // namespace MesaFOZ
+
+  static FileMapperFunc FileMapper = nullptr;
 
   bool FOZFile::Open(const fextl::string& FOZFileName, bool ReadOnly) {
     FileName = FOZFileName;
@@ -154,11 +160,17 @@ namespace DiskCache {
       return false;
     }
 
+    File::File::FileHandleType CacheFileHandle = CacheFOZ.GetHandle();
+    if (FileMapper && CacheFileHandle != (File::File::FileHandleType)-1) {
+      CacheFileMapping = reinterpret_cast<uint8_t*>(FileMapper(CacheFileHandle, ReadOnly ? CacheFOZ.Size() : BIG_MAPPING_SIZE));
+      CacheFileSize = CacheFOZ.Size();
+    }
+
     this->ReadOnly = ReadOnly;
     return true;
   }
 
-  void IndexedDB::PopulateIndex(Index& CacheIndex) {
+  void IndexedDB::PopulateIndex(Index& CacheIndex, bool& FoundMetadata) {
     fextl::vector<uint8_t> Data;
     if (!IndexFOZ.ReadAll(Data)) {
       return;
@@ -184,21 +196,36 @@ namespace DiskCache {
       const auto* IndexBlobPayload = reinterpret_cast<const MesaFOZ::mesa_index_db_file_entry*>(IndexDataStart + ReadOffset);
       ReadOffset += FOZHeader->payload_size;
 
-      if (IndexBlobPayload->hash != XXH3_64bits(FOZKey->bytes, FOSSILIZE_BLOB_HASH_LENGTH)) {
-        break;
-      }
       // skip corrupt (carefully) so we don't have to figure that out in the hot path later
       if (IndexBlobPayload->cache_db_file_offset > (uint64_t)CacheFOZSize ||
           IndexBlobPayload->size > (uint64_t)CacheFOZSize - IndexBlobPayload->cache_db_file_offset) {
         continue;
       }
-      CacheIndex.insert({IndexBlobPayload->hash, {this, IndexBlobPayload->cache_db_file_offset, IndexBlobPayload->size}});
+      if (FOZKey->bytes[39] != 0xFF) {
+        uint64_t Key;
+        std::from_chars(reinterpret_cast<const char*>(FOZKey->bytes), reinterpret_cast<const char*>(&FOZKey->bytes[16]), Key, 16);
+        if (IndexBlobPayload->hash != Key) {
+          continue;
+        }
+        CacheIndex.insert({IndexBlobPayload->hash, {this, IndexBlobPayload->cache_db_file_offset, IndexBlobPayload->size}});
+      } else {
+        FoundMetadata = true;
+      }
     }
     // could truncate/delete index if we don't end up perfectly at end here
   }
 
   bool IndexedDB::ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob) {
-    return CacheFOZ.ReadBlob(Offset, OutBlob);
+    if (CacheFileMapping && (ReadOnly || Offset + OutBlob.size() <= BIG_MAPPING_SIZE)) {
+      if (Offset + OutBlob.size() > CacheFileSize) {
+        return false;
+      }
+      // todo could reduce copies by having a private mapping for relocs, etc
+      memcpy(OutBlob.data(), CacheFileMapping + Offset, OutBlob.size());
+      return true;
+    } else {
+      return CacheFOZ.ReadBlob(Offset, OutBlob);
+    }
   }
 
   bool IndexedDB::StoreCacheBlob(const MesaFOZ::foz_payload_key& Key, std::span<const uint8_t> Blob, Index& Index, std::mutex& IndexMutex) {
@@ -206,7 +233,12 @@ namespace DiskCache {
       // shouldn't happen
       return false;
     }
-    uint64_t Hash = XXH3_64bits(Key.bytes, FOSSILIZE_BLOB_HASH_LENGTH);
+    uint64_t Hash;
+    if (Key.bytes[39] != 0xFF) {
+      std::from_chars(reinterpret_cast<const char*>(Key.bytes), reinterpret_cast<const char*>(&Key.bytes[16]), Hash, 16);
+    } else {
+      Hash = ~0;
+    }
     {
       std::lock_guard Guard(IndexMutex);
       if (Index.contains(Hash)) {
@@ -246,6 +278,11 @@ namespace DiskCache {
     CacheFOZ.Unlock();
     IndexFOZ.Unlock();
 
+    // publish new file size for memory-mapped reads
+    if (CacheFileMapping) {
+      CacheFileSize = BlobOffset + Blob.size();
+    }
+
     std::lock_guard Guard(IndexMutex);
     Index[Hash] = {this, BlobOffset, (uint32_t)Blob.size()};
     return true;
@@ -269,7 +306,7 @@ namespace DiskCache {
       return false;
     }
 
-    CurDB->PopulateIndex(Index);
+    CurDB->PopulateIndex(Index, FoundMetadata);
 
     if (ReadOnly) {
       ROCacheDBs.push_back(std::move(CurDB));
@@ -280,6 +317,10 @@ namespace DiskCache {
     return true;
   }
 
+  FEX_DEFAULT_VISIBILITY void SetFileMapper(FileMapperFunc Func) {
+    FileMapper = Func;
+  }
+
   void DiskCache::Init(FEXCore::Context::ContextImpl* CTX) {
     this->CTX = CTX;
 
@@ -287,17 +328,41 @@ namespace DiskCache {
       return;
     }
 
-    // todo grab all CTX options that can change compilation here + any environmental/hw things and hash into a bucket key
+    fextl::string SerializedConfig = FEXCore::Config::SerializeForCache();
+
+    struct __attribute__((packed)) {
+      uint16_t FormatVersion;
+      uint8_t Is64BitMode;
+      uint64_t HostFeaturesHash;
+    } BucketHeader = {FormatVersion, CTX->Config.Is64BitMode, CTX->HostFeatures.HashForCaching()};
+
+    fextl::vector<uint8_t> BucketBytes;
+    BucketBytes.resize(sizeof(BucketHeader) + SerializedConfig.size());
+    memcpy(BucketBytes.data(), &BucketHeader, sizeof(BucketHeader));
+    memcpy(BucketBytes.data() + sizeof(BucketHeader), SerializedConfig.data(), SerializedConfig.size());
+    BucketHash = XXH3_128bits(BucketBytes.data(), BucketBytes.size());
 
     fextl::string BasePath = BasePathOverride();
     if (BasePath.empty()) {
-      // todo put bucket hash in that path
       BasePath = FEXCore::Config::GetCacheDirectory() + "DiskCache/";
+      BasePath += fextl::fmt::format("{:016x}{:016x}", BucketHash.high64, BucketHash.low64) + "/";
     }
     FHU::Filesystem::CreateDirectories(BasePath);
 
+    if (!MapDiskCacheFiles) {
+      FileMapper = nullptr;
+    }
+
     fextl::string RWDBBasePath = BasePath + "RWCacheDB";
     OpenCacheDB(RWDBBasePath, false);
+
+    if (RWCacheDB && !FoundMetadata) {
+      // we just opened a fresh cache, add a metadata blob
+      MesaFOZ::foz_payload_key MetadataKey;
+      memset(MetadataKey.bytes, 0xFF, sizeof(MetadataKey));
+      RWCacheDB->StoreCacheBlob(MetadataKey, {BucketBytes.data(), BucketBytes.size()}, Index, IndexLock);
+      Index.clear();
+    }
 
     std::string_view RONames = RODBNames();
     while (!RONames.empty()) {
@@ -320,17 +385,22 @@ namespace DiskCache {
     }
   }
 
+  uint64_t DiskCache::MakeBlobKey(const uint64_t ModuleOffset) {
+    struct {
+      uint64_t ModuleOffset;
+      XXH128_hash_t BucketHash;
+    } BlobKeyBytes = {ModuleOffset, BucketHash};
+
+    return XXH3_64bits(&BlobKeyBytes, sizeof(BlobKeyBytes));
+  }
+
   std::optional<CodeHitData> DiskCache::Lookup(Core::InternalThreadState* Thread, const ExecutableFileSectionInfo& Region, uint64_t GuestRIP) {
     if (!IsReadingDiskCache()) {
       return std::nullopt;
     }
     uint64_t ModuleOffset = GuestRIP - Region.FileStartVA;
 
-    // todo move key making to a helper once we have options and stuff (see Store)
-    MesaFOZ::foz_payload_key Key = {};
-    memcpy(Key.bytes, &ModuleOffset, sizeof(ModuleOffset));
-
-    uint64_t Hash = XXH3_64bits(Key.bytes, FOSSILIZE_BLOB_HASH_LENGTH);
+    uint64_t Hash = MakeBlobKey(ModuleOffset);
 
     IndexEntry Entry;
     {
@@ -374,55 +444,33 @@ namespace DiskCache {
     // LogMan::Msg::IFmt("hash ok! length {:d}", Header.GuestSize);
 
     // this seems to be a full hit, lastly, check the entry is big enough to have everything (except maybe GuestCode)
-    uint32_t SizeNeeded = sizeof(Header) + Header.HostSize + Header.EntryPointCount * sizeof(BlobEntryPoint);
+    uint32_t SizeNeeded = sizeof(Header) + Header.HostSize + Header.EntryPointCount * (sizeof(uint64_t) + sizeof(uint32_t));
     SizeNeeded += Header.SmallRelocCount * sizeof(BlobSmallRelocation) + Header.ThunkRelocCount * sizeof(BlobThunkRelocation) +
-                  Header.TouchedGuestPagesCount * sizeof(int64_t);
+                  Header.TouchedGuestPagesCount * sizeof(uint64_t);
     if (Entry.Size < SizeNeeded) {
       return std::nullopt;
     }
 
-    HitData.HostCode = {HitData.Blob.data() + sizeof(Header), Header.HostSize};
-    HitData.EntryPoints = {reinterpret_cast<const BlobEntryPoint*>(HitData.Blob.data() + sizeof(Header) + Header.HostSize), Header.EntryPointCount};
+    uint32_t BlobOffset = sizeof(Header);
 
-    auto* SmallRelocs = reinterpret_cast<const BlobSmallRelocation*>(
-      HitData.Blob.data() + sizeof(Header) + Header.HostSize + Header.EntryPointCount * sizeof(BlobEntryPoint));
-    auto* ThunkRelocs = reinterpret_cast<const BlobThunkRelocation*>(
-      reinterpret_cast<const uint8_t*>(SmallRelocs) + Header.SmallRelocCount * sizeof(BlobSmallRelocation));
+    HitData.HostCode = {HitData.Blob.data() + BlobOffset, Header.HostSize};
+    BlobOffset += Header.HostSize;
+    HitData.GuestPages = {reinterpret_cast<uint64_t*>(HitData.Blob.data() + BlobOffset), Header.TouchedGuestPagesCount};
+    BlobOffset += Header.TouchedGuestPagesCount * sizeof(uint64_t);
+    HitData.EntryPointRIPs = {reinterpret_cast<uint64_t*>(HitData.Blob.data() + BlobOffset), Header.EntryPointCount};
+    BlobOffset += Header.EntryPointCount * sizeof(uint64_t);
+    HitData.EntryPointHostOffsets = {reinterpret_cast<const uint32_t*>(HitData.Blob.data() + BlobOffset), Header.EntryPointCount};
+    BlobOffset += Header.EntryPointCount * sizeof(uint32_t);
+    HitData.SmallRelocs = {reinterpret_cast<const BlobSmallRelocation*>(HitData.Blob.data() + BlobOffset), Header.SmallRelocCount};
+    BlobOffset += Header.SmallRelocCount * sizeof(BlobSmallRelocation);
+    HitData.ThunkRelocs = {reinterpret_cast<const BlobThunkRelocation*>(HitData.Blob.data() + BlobOffset), Header.ThunkRelocCount};
+    BlobOffset += Header.ThunkRelocCount * sizeof(BlobThunkRelocation);
 
-    HitData.Relocations.reserve(Header.SmallRelocCount + Header.ThunkRelocCount);
-    for (uint32_t i = 0; i < Header.SmallRelocCount; ++i) {
-      const auto& SmallReloc = SmallRelocs[i];
-      FEXCore::CPU::Relocation Reloc = FEXCore::CPU::Relocation::Default();
-      Reloc.Header.Type = (CPU::RelocationTypes)SmallReloc.Type;
-      Reloc.Header.Offset = SmallReloc.Offset;
-      switch (SmallReloc.Type) {
-      case uint8_t(CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL):
-        Reloc.NamedSymbolLiteral.Symbol = CPU::RelocNamedSymbolLiteral::NamedSymbol(SmallReloc.Named.Symbol);
-        break;
-      case uint8_t(CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL): Reloc.GuestRIP.GuestRIP = SmallReloc.RIPLiteral.GuestRIP; break;
-      case uint8_t(CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE):
-        Reloc.GuestRIP.RegisterIndex = SmallReloc.RIPMove.RegisterIndex;
-        Reloc.GuestRIP.GuestRIP = SmallReloc.RIPMove.GuestRIP;
-        break;
-      default: return std::nullopt;
-      }
-      HitData.Relocations.push_back(Reloc);
+    for (auto& PageOffset : HitData.GuestPages) {
+      PageOffset += GuestRIP;
     }
-    for (uint32_t i = 0; i < Header.ThunkRelocCount; ++i) {
-      const auto& BigReloc = ThunkRelocs[i];
-      FEXCore::CPU::Relocation Reloc = FEXCore::CPU::Relocation::Default();
-      Reloc.NamedThunkMove.Header.Offset = BigReloc.Offset;
-      Reloc.NamedThunkMove.Header.Type = CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE;
-      Reloc.NamedThunkMove.RegisterIndex = BigReloc.RegisterIndex;
-      memcpy(&Reloc.NamedThunkMove.Symbol, BigReloc.SymbolHash, sizeof(BigReloc.SymbolHash));
-      HitData.Relocations.push_back(Reloc);
-    }
-
-    auto* PageOffsets =
-      reinterpret_cast<const int64_t*>(reinterpret_cast<const uint8_t*>(ThunkRelocs) + Header.ThunkRelocCount * sizeof(BlobThunkRelocation));
-    HitData.GuestPages.reserve(Header.TouchedGuestPagesCount);
-    for (uint32_t i = 0; i < Header.TouchedGuestPagesCount; ++i) {
-      HitData.GuestPages.push_back(GuestRIP + PageOffsets[i]);
+    for (auto& EntryPointRip : HitData.EntryPointRIPs) {
+      EntryPointRip += GuestRIP;
     }
 
     return HitData;
@@ -475,7 +523,6 @@ namespace DiskCache {
     uint32_t SmallRelocCount = 0;
     uint32_t ThunkRelocCount = 0;
     for (const auto& Reloc : Relocations) {
-      // relocs aren't cleared every time if IsGeneratingCache, so filter just in case
       if (Reloc.Header.Type == CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE) {
         ThunkRelocCount++;
       } else {
@@ -488,11 +535,12 @@ namespace DiskCache {
 
     const size_t HeaderOffset = 0;
     const size_t HostCodeOffset = HeaderOffset + sizeof(BlobFixedHeader);
-    const size_t EntryPointsOffset = HostCodeOffset + CompiledCode.Size;
-    const size_t SmallRelocsOffset = EntryPointsOffset + EntryPointCount * sizeof(BlobEntryPoint);
+    const size_t TouchedGuestPagesOffset = HostCodeOffset + CompiledCode.Size;
+    const size_t EntryPointRIPsOffset = TouchedGuestPagesOffset + TouchedGuestPagesCount * sizeof(uint64_t);
+    const size_t EntryPointHostOffsetsOffset = EntryPointRIPsOffset + EntryPointCount * sizeof(uint64_t);
+    const size_t SmallRelocsOffset = EntryPointHostOffsetsOffset + EntryPointCount * sizeof(uint32_t);
     const size_t ThunkRelocsOffset = SmallRelocsOffset + SmallRelocCount * sizeof(BlobSmallRelocation);
-    const size_t TouchedGuestPagesOffset = ThunkRelocsOffset + ThunkRelocCount * sizeof(BlobThunkRelocation);
-    const size_t GuestCodeOffset = TouchedGuestPagesOffset + TouchedGuestPagesCount * sizeof(int64_t);
+    const size_t GuestCodeOffset = ThunkRelocsOffset + ThunkRelocCount * sizeof(BlobThunkRelocation);
     const size_t TotalSize = GuestCodeOffset + GuestCode.size();
 
     // we'll copy everything into here and pass it to the Writer, then return to caller quickly
@@ -502,10 +550,10 @@ namespace DiskCache {
 
     uint64_t ModuleOffset = GuestRIP - Region.FileStartVA;
 
-    // todo also copy/hash options that affect codegen into the key
-    // todo should try to keep the key ascii i think?
+    uint64_t BlobKey = MakeBlobKey(ModuleOffset);
     MesaFOZ::foz_payload_key Key = {};
-    memcpy(Key.bytes, &ModuleOffset, sizeof(ModuleOffset));
+    fextl::string BlobName = fextl::fmt::format("{:016x}", BlobKey);
+    memcpy(Key.bytes, BlobName.data(), BlobName.size());
 
     BlobFixedHeader Header {
       .GuestSize = (uint32_t)GuestCode.size(),
@@ -519,11 +567,21 @@ namespace DiskCache {
     memcpy(BlobData + HeaderOffset, &Header, sizeof(Header));
     memcpy(BlobData + HostCodeOffset, CompiledCode.BlockBegin, CompiledCode.Size);
 
+    // relocate touched pages relative to GuestRIP
+    auto* PageOffsets = reinterpret_cast<uint64_t*>(BlobData + TouchedGuestPagesOffset);
+    uint32_t PageIdx = 0;
+    for (auto GuestPage : DecodedBlockInfo->CodePages) {
+      PageOffsets[PageIdx++] = GuestPage - GuestRIP;
+    }
+
     // pack and relocate entrypoints
-    auto* EntryPoints = reinterpret_cast<BlobEntryPoint*>(BlobData + EntryPointsOffset);
+    auto* EntryRIPs = reinterpret_cast<uint64_t*>(BlobData + EntryPointRIPsOffset);
+    auto* EntryHostOffsets = reinterpret_cast<uint32_t*>(BlobData + EntryPointHostOffsetsOffset);
     uint32_t EntryIdx = 0;
     for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
-      EntryPoints[EntryIdx++] = {GuestAddr - Region.FileStartVA, uint32_t(HostAddr - CompiledCode.BlockBegin)};
+      EntryRIPs[EntryIdx] = GuestAddr - GuestRIP;
+      EntryHostOffsets[EntryIdx] = uint32_t(HostAddr - CompiledCode.BlockBegin);
+      EntryIdx++;
     }
 
     // pack relocations
@@ -569,14 +627,6 @@ namespace DiskCache {
         break;
       }
       }
-    }
-
-    // relocate touched pages relative to GuestRIP
-    // in theory we could save some size here, unlikely we need all 64bits
-    auto* PageOffsets = reinterpret_cast<int64_t*>(BlobData + TouchedGuestPagesOffset);
-    uint32_t PageIdx = 0;
-    for (auto GuestPage : DecodedBlockInfo->CodePages) {
-      PageOffsets[PageIdx++] = GuestPage - GuestRIP;
     }
 
     memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());

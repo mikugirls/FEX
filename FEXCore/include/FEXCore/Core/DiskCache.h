@@ -62,11 +62,6 @@ namespace DiskCache {
     XXH128_hash_t GuestHash;
   };
 
-  struct __attribute__((packed)) BlobEntryPoint {
-    uint64_t GuestRIP; // todo those have been made relative since i wrote this, can we get away with less size here?
-    uint32_t HostOffset;
-  };
-
   // packed struct for types 0, 2 and 3. type 1 is bigger and separate below
   struct __attribute__((packed)) BlobSmallRelocation {
     uint32_t Offset;
@@ -95,9 +90,11 @@ namespace DiskCache {
   struct CodeHitData {
     fextl::vector<uint8_t> Blob;
     std::span<uint8_t> HostCode;
-    std::span<const BlobEntryPoint> EntryPoints;
-    fextl::vector<FEXCore::CPU::Relocation> Relocations;
-    fextl::vector<uint64_t> GuestPages;
+    std::span<uint64_t> GuestPages;
+    std::span<uint64_t> EntryPointRIPs;
+    std::span<const uint32_t> EntryPointHostOffsets;
+    std::span<const BlobSmallRelocation> SmallRelocs;
+    std::span<const BlobThunkRelocation> ThunkRelocs;
 
     // the spans above point to memory owned by the Blob vec, so it's important this can't be copied
     CodeHitData() = default;
@@ -124,6 +121,9 @@ namespace DiskCache {
       }
       return FD->Unlock();
     }
+    File::File::FileHandleType GetHandle() {
+      return FD ? FD->GetHandle() : (File::File::FileHandleType)-1;
+    }
     ssize_t Size();
     bool ReadAll(fextl::vector<uint8_t>& Out); // from first blob
     bool ReadBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
@@ -140,15 +140,18 @@ namespace DiskCache {
   class IndexedDB {
   public:
     bool Open(const fextl::string& CacheDBName, bool ReadOnly);
-    void PopulateIndex(Index& CacheIndex);
+    void PopulateIndex(Index& CacheIndex, bool& FoundMetadata);
     bool ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
     bool StoreCacheBlob(const MesaFOZ::foz_payload_key& Key, std::span<const uint8_t> Blob, Index& CacheIndex, std::mutex& IndexMutex);
 
   private:
     // stores run on the Writer, so returning quick isn't as important
     static constexpr uint32_t STORE_LOCK_TIMEOUT_MS = 1000;
+    static constexpr uint64_t BIG_MAPPING_SIZE = 1ULL << 33;
 
     FOZFile CacheFOZ;
+    uint8_t* CacheFileMapping = nullptr;
+    std::atomic<uint64_t> CacheFileSize;
     FOZFile IndexFOZ;
     bool ReadOnly = false;
   };
@@ -171,18 +174,23 @@ namespace DiskCache {
 
   private:
     bool OpenCacheDB(const fextl::string& CacheDBName, bool ReadOnly);
+    uint64_t MakeBlobKey(const uint64_t ModuleOffset);
 
     FEXCore::Context::ContextImpl* CTX;
+    static const uint16_t FormatVersion = 3;
+    XXH128_hash_t BucketHash;
     fextl::vector<fextl::unique_ptr<IndexedDB>> ROCacheDBs;
     fextl::unique_ptr<IndexedDB> RWCacheDB;
     Index Index;
     std::mutex IndexLock;
+    bool FoundMetadata = false;
     struct CacheStoreWorkItem;
 
     // the Writer holds references to all this stuff above and needs to be last
     fextl::unique_ptr<WorkQueueThread> Writer;
 
     FEX_CONFIG_OPT(EnableDiskCache, DISKCACHE);
+    FEX_CONFIG_OPT(MapDiskCacheFiles, DISKCACHEFILEMAPPING);
     FEX_CONFIG_OPT(RelocationFilter, DISKCACHERELOCATIONFILTER);
     FEX_CONFIG_OPT(BasePathOverride, DISKCACHEPATH);
     FEX_CONFIG_OPT(RODBNames, DISKCACHERODBNAMES);
