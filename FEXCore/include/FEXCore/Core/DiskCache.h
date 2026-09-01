@@ -50,6 +50,15 @@ namespace DiskCache {
     IndexedDB* DB;
     uint64_t Offset;
     uint32_t Size;
+    uint32_t GuestSize;
+    XXH128_hash_t GuestHash;
+    fextl::vector<uint32_t> GuestExtents;
+  };
+
+  struct __attribute__((packed)) IndexExtraBlobHeader {
+    XXH128_hash_t GuestHash;
+    uint32_t GuestSize;
+    uint32_t GuestExtentsCount;
   };
 
   struct __attribute__((packed)) BlobFixedHeader {
@@ -142,7 +151,8 @@ namespace DiskCache {
     bool Open(const fextl::string& CacheDBName, bool ReadOnly);
     void PopulateIndex(Index& CacheIndex, bool& FoundMetadata);
     bool ReadCacheBlob(uint64_t Offset, std::span<uint8_t> OutBlob);
-    bool StoreCacheBlob(const MesaFOZ::foz_payload_key& Key, std::span<const uint8_t> Blob, Index& CacheIndex, std::mutex& IndexMutex);
+    bool StoreCacheBlob(const MesaFOZ::foz_payload_key& Key, std::span<const uint8_t> Blob, Index& CacheIndex, std::mutex& IndexMutex,
+                        std::span<const uint8_t> IndexBlob);
 
   private:
     // stores run on the Writer, so returning quick isn't as important
@@ -177,7 +187,6 @@ namespace DiskCache {
     uint64_t MakeBlobKey(const uint64_t ModuleOffset);
 
     FEXCore::Context::ContextImpl* CTX;
-    static const uint16_t FormatVersion = 3;
     XXH128_hash_t BucketHash;
     fextl::vector<fextl::unique_ptr<IndexedDB>> ROCacheDBs;
     fextl::unique_ptr<IndexedDB> RWCacheDB;
@@ -195,6 +204,11 @@ namespace DiskCache {
     FEX_CONFIG_OPT(BasePathOverride, DISKCACHEPATH);
     FEX_CONFIG_OPT(RODBNames, DISKCACHERODBNAMES);
   };
+
+  // TODO: This header is in global installed header path, but uses internal headers.
+  // Migrate this once that is fixed.
+  static constexpr uint16_t FormatVersion = 6;
+  FEX_DEFAULT_VISIBILITY uint16_t GetFormatVersion();
 
 } // namespace DiskCache
 
