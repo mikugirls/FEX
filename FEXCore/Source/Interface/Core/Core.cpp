@@ -542,7 +542,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   if (!HasCustomIR) {
     const auto* GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
-    Thread->FrontendDecoder->DecodeInstructionsAtEntry(Thread, GuestCode, GuestRIP, MaxInst);
+    Thread->FrontendDecoder->DecodeLoop(GuestCode);
 
     const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     const auto& CodeBlocks = BlockInfo->Blocks;
@@ -816,6 +816,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
   if (!IRView) {
+    Thread->FrontendDecoder->ValidateDisownedOrFree();
+    Thread->OpDispatcher->ValidateDisownedOrFree();
     // OpDispatcher IR already released in this case.
     return {{}, nullptr, 0, 0, false};
   }
@@ -829,6 +831,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
     if (auto Block = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
       // Raced to compile, release the OpDispatcher IR.
       Thread->OpDispatcher->DelayedDisownBuffer();
+      Thread->FrontendDecoder->ValidateDisownedOrFree();
+      Thread->OpDispatcher->ValidateDisownedOrFree();
       return {.CompiledCode = {.BlockBegin = reinterpret_cast<uint8_t*>(Block), .EntryPoints = {{GuestRIP, reinterpret_cast<uint8_t*>(Block)}}},
               .DebugData = nullptr,
               .StartAddr = 0,
@@ -847,6 +851,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   // Release the IR
   Thread->OpDispatcher->DelayedDisownBuffer();
 
+  Thread->FrontendDecoder->ValidateDisownedOrFree();
+  Thread->OpDispatcher->ValidateDisownedOrFree();
   return {
     .CompiledCode = std::move(CompiledCode),
     .DebugData = std::move(DebugData),
@@ -883,13 +889,16 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     return HostCode;
   }
 
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
   std::optional<DiskCache::CodeHitData> Hit;
+  std::optional<uint64_t> DiskCacheGuestCodeKey;
   bool DiskCacheHitRelocationsApplied = false;
   bool LoadDiskCacheCode = true;
-  if (Region && Region->FileStartVA != 0) {
+  {
     FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
-    Hit = DiskCache.Lookup(Thread, *Region, GuestRIP);
+    Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
     if (Hit) {
       DiskCacheHitRelocationsApplied =
         CodeCache.ApplyPackedCodeRelocations(GuestRIP, std::as_writable_bytes(Hit->HostCode), Hit->SmallRelocs, Hit->ThunkRelocs, false);
@@ -917,6 +926,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
           LOGMAN_THROW_A_FMT(CachedHostCode != 0, "Couldn't find GuestRIP in Disk Cache entrypoints!");
 
           FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheHitCount, 1);
+          Thread->FrontendDecoder->DelayedDisownBuffer();
+
+          Thread->FrontendDecoder->ValidateDisownedOrFree();
+          Thread->OpDispatcher->ValidateDisownedOrFree();
           return CachedHostCode;
         }
       }
@@ -994,16 +1007,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   // Disk Cache
-  if (Region && Region->FileStartVA != 0 && !CodeCache.IsGeneratingCache) {
-    std::span<const FEXCore::CPU::Relocation> Relocations;
-    if (DebugData && DebugData->Relocations) {
-      Relocations = *DebugData->Relocations;
+  if (!CodeCache.IsGeneratingCache) {
+    if (DiskCacheGuestCodeKey) {
+      std::span<const FEXCore::CPU::Relocation> Relocations;
+      if (DebugData && DebugData->Relocations) {
+        Relocations = *DebugData->Relocations;
+      }
+      std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(StartAddr), Length};
+      const Frontend::Decoder::DecodedBlockInformation* BlockInfo =
+        NeedsAddGuestCodeRanges ? Thread->FrontendDecoder->GetDecodedBlockInfo() : nullptr;
+      DiskCache.Store(Thread, Region, GuestRIP, *DiskCacheGuestCodeKey, GuestCode, CompiledCode, Relocations, BlockInfo);
     }
-    std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(StartAddr), Length};
-    const Frontend::Decoder::DecodedBlockInformation* BlockInfo = NeedsAddGuestCodeRanges ? Thread->FrontendDecoder->GetDecodedBlockInfo() : nullptr;
-    DiskCache.Store(Thread, *Region, GuestRIP, GuestCode, CompiledCode, Relocations, BlockInfo);
 
-    if (CodeMapWriter) {
+    if (CodeMapWriter && Region && Region->FileStartVA != 0) {
       CodeMapWriter->AppendBlock(*Region, GuestRIP);
     }
   }
@@ -1018,6 +1034,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     Thread->CPUBackend->ClearRelocations();
   }
 
+  Thread->FrontendDecoder->ValidateDisownedOrFree();
+  Thread->OpDispatcher->ValidateDisownedOrFree();
+
   return (uintptr_t)CodePtr;
 }
 
@@ -1030,6 +1049,7 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
   auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
